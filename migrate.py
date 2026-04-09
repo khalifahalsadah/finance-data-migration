@@ -133,6 +133,7 @@ def run_validation(wb_data, projects, erp):
             wb_data['deliverables'].get(proj_id, []),
             invoices,
             tasks,
+            erp,
         )
 
     return all_results

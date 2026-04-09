@@ -235,7 +235,13 @@ class ERPClient:
             limit=50,
         )
 
-    # ── PPI (read-only for expenses and deliverables) ────────────
+    # ── Sales Invoice detail (with items child table) ──────────
+
+    def get_sales_invoice_detail(self, sinv_name):
+        """Fetch full Sales Invoice including items child table."""
+        return self._get(f'/api/resource/Sales Invoice/{sinv_name}')['data']
+
+    # ── PPI (read-only for expenses) ─────────────────────────────
 
     def get_ppi(self, proj_id):
         return self._get(f'/api/resource/Project Profitably Input/{proj_id}')['data']

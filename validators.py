@@ -1,7 +1,15 @@
 """Validators for each sheet — compare sheet data against live ERP."""
 
+import re
 from config import VALID_WORKFLOW_STATES
 from invoice_matcher import match_invoice, build_invoice_map
+
+
+def _strip_html(text):
+    """Strip HTML tags from a string."""
+    if not text:
+        return ''
+    return re.sub(r'<[^>]+>', '', str(text)).strip()
 
 
 def _erp_action(status):
@@ -1072,9 +1080,11 @@ def _match_task(deliverable_name, erp_tasks):
     return None
 
 
-def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
+def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_client=None):
     results = []
     sheet_name = '7. Deliverables & Invoices'
+    TASK = 'Task'
+    SI = 'Sales Invoice'
 
     data_rows = [r for r in sheet_rows if r.get('deliverable')]
     empty_rows = [r for r in sheet_rows if not r.get('deliverable')]
@@ -1082,7 +1092,6 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
 
     if not data_rows:
         if erp_invoices:
-            # Show each ERP invoice as MISSING_IN_SHEET
             for inv in erp_invoices:
                 for fn, ek in [('invoice', 'name'), ('amount', 'grand_total'),
                                ('status', 'status'), ('date', 'posting_date')]:
@@ -1092,6 +1101,7 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
                         results.append(_result(
                             proj_id, sheet_name, f'{inv["name"]} — {fn}',
                             e_d, '(not in sheet)', 'MISSING_IN_SHEET',
+                            target_doctype=SI,
                         ))
         elif empty_rows:
             confirmed = [r for r in empty_rows if r.get('status') == 'Confirmed']
@@ -1106,60 +1116,205 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
                                    'MANDATORY_EMPTY', 'No data'))
         return results
 
-    # Build invoice map for matching
+    # Build invoice map
     sheet_inv_refs = [r['invoice_num'] for r in data_rows if r.get('invoice_num')]
     inv_map, unmatched_erp = build_invoice_map(sheet_inv_refs, erp_invoices)
 
+    # Group sheet deliverables by invoice ref
+    from collections import defaultdict
+    by_invoice = defaultdict(list)
+    for row in data_rows:
+        ref = row.get('invoice_num') or 'no_invoice'
+        by_invoice[ref].append(row)
+
+    # Cache fetched SI details
+    si_detail_cache = {}
+    si_items_by_invoice = {}
+
+    # ── VALIDATION 1: Per-invoice count + sum vs SI items ──
+    for inv_ref, sheet_delivs in by_invoice.items():
+        if inv_ref == 'no_invoice':
+            continue
+
+        matched_inv = inv_map.get(inv_ref)
+        if not matched_inv:
+            results.append(_result(
+                proj_id, sheet_name, f'Invoice {inv_ref}',
+                '(not in ERP)', inv_ref, 'MISSING_IN_ERP',
+                f'Invoice {inv_ref} not found',
+                target_doctype=SI, target_field='name',
+            ))
+            continue
+
+        # Fetch SI detail with items
+        si_name = matched_inv['name']
+        si_items = []
+        if erp_client and si_name not in si_detail_cache:
+            try:
+                si_detail = erp_client.get_sales_invoice_detail(si_name)
+                si_detail_cache[si_name] = si_detail
+                si_items = si_detail.get('items', [])
+                si_items_by_invoice[si_name] = si_items
+            except Exception:
+                si_items = []
+        elif si_name in si_detail_cache:
+            si_items = si_items_by_invoice.get(si_name, [])
+
+        inv_label = f'Invoice {inv_ref} ({si_name})'
+
+        # Count validation
+        sheet_count = len(sheet_delivs)
+        si_count = len(si_items)
+        if sheet_count == si_count:
+            results.append(_result(
+                proj_id, sheet_name, f'{inv_label} — deliverable count',
+                str(si_count), str(sheet_count), 'MATCH',
+                target_doctype=SI, target_field='items',
+            ))
+        else:
+            results.append(_result(
+                proj_id, sheet_name, f'{inv_label} — deliverable count',
+                str(si_count), str(sheet_count), 'UPDATE',
+                f'Sheet has {sheet_count}, SI has {si_count}',
+                target_doctype=SI, target_field='items',
+            ))
+
+        # Sum validation (sheet invoice_amount sum vs SI items amount sum)
+        sheet_sum = sum(float(d.get('invoice_amount') or d.get('amount') or 0) for d in sheet_delivs)
+        si_sum = sum(item.get('amount', 0) for item in si_items)
+        if abs(sheet_sum - si_sum) < 1:
+            results.append(_result(
+                proj_id, sheet_name, f'{inv_label} — amount sum',
+                f'{si_sum:,.0f}', f'{sheet_sum:,.0f}', 'MATCH',
+                target_doctype=SI, target_field='items.amount',
+            ))
+        else:
+            results.append(_result(
+                proj_id, sheet_name, f'{inv_label} — amount sum',
+                f'{si_sum:,.0f}', f'{sheet_sum:,.0f}', 'UPDATE',
+                f'Sum mismatch: SI items={si_sum:,.0f}, Sheet={sheet_sum:,.0f}',
+                target_doctype=SI, target_field='items.amount',
+            ))
+
+        # Per-deliverable vs SI item comparison
+        matched_si_items = set()
+        for sd in sheet_delivs:
+            sd_name = (sd.get('deliverable') or '').strip()
+            sd_amt = float(sd.get('invoice_amount') or sd.get('amount') or 0)
+            sd_label = f'{sd_name[:35]}'
+
+            # Match by name in SI item description (strip HTML)
+            matched_item = None
+            for idx, si_item in enumerate(si_items):
+                if idx in matched_si_items:
+                    continue
+                si_desc = _strip_html(si_item.get('description', ''))
+                if sd_name and si_desc and sd_name.strip()[:20] == si_desc.strip()[:20]:
+                    matched_item = (idx, si_item)
+                    break
+
+            if matched_item:
+                idx, si_item = matched_item
+                matched_si_items.add(idx)
+                si_desc = _strip_html(si_item.get('description', ''))
+                si_amt = si_item.get('amount', 0)
+
+                results.append(_result(
+                    proj_id, sheet_name, f'{sd_label} — vs SI item name',
+                    si_desc[:40], sd_name[:40], 'MATCH',
+                    target_doctype=SI, target_field='items.description',
+                ))
+                if abs(sd_amt - si_amt) < 1:
+                    results.append(_result(
+                        proj_id, sheet_name, f'{sd_label} — vs SI item amount',
+                        f'{si_amt:,.0f}', f'{sd_amt:,.0f}', 'MATCH',
+                        target_doctype=SI, target_field='items.amount',
+                    ))
+                else:
+                    results.append(_result(
+                        proj_id, sheet_name, f'{sd_label} — vs SI item amount',
+                        f'{si_amt:,.0f}', f'{sd_amt:,.0f}', 'UPDATE',
+                        target_doctype=SI, target_field='items.amount',
+                    ))
+            else:
+                results.append(_result(
+                    proj_id, sheet_name, f'{sd_label} — vs SI item',
+                    '(no matching SI item)', sd_name[:40], 'MISSING_IN_ERP',
+                    'Deliverable not found in SI items',
+                    target_doctype=SI, target_field='items.description',
+                ))
+
+        # SI items not matched
+        for idx, si_item in enumerate(si_items):
+            if idx not in matched_si_items:
+                si_desc = _strip_html(si_item.get('description', ''))
+                results.append(_result(
+                    proj_id, sheet_name, f'{si_desc[:35]} — SI item not in sheet',
+                    f'{si_item.get("amount", 0):,.0f}', '(not in sheet)', 'MISSING_IN_SHEET',
+                    target_doctype=SI, target_field='items.description',
+                ))
+
+    # ── VALIDATION 2: Per-deliverable vs Task ──
     for i, row in enumerate(data_rows, 1):
         deliv_name = (row.get('deliverable') or '')[:35]
         row_label = f'Row {i} ({deliv_name})'
         row_status = row.get('status')
-        inv_ref = row.get('invoice_num')
-        matched_inv = inv_map.get(inv_ref) if inv_ref else None
 
-        TASK = 'Task'
-        SI = 'Sales Invoice'
-
-        # ── Deliverable fields (target: Task doctype) ──
+        # Deliverable name vs Task
         if row.get('deliverable'):
             if has_tasks:
-                # Find matching task by subject/deliverable name
                 matched_task = _match_task(row['deliverable'], erp_tasks)
                 if matched_task:
                     results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — deliverable',
+                        proj_id, sheet_name, f'{row_label} — vs Task name',
                         matched_task.get('subject', ''), row['deliverable'], 'MATCH',
                         target_doctype=TASK, target_field='subject',
                         target_name=matched_task['name'],
                     ))
+                    # Compare amount
+                    task_amt = matched_task.get('custom_deliverable_amount') or matched_task.get('custom_amount_') or 0
+                    sheet_amt = float(row.get('amount') or 0)
+                    if task_amt and abs(float(task_amt) - sheet_amt) > 1:
+                        results.append(_result(
+                            proj_id, sheet_name, f'{row_label} — vs Task amount',
+                            f'{float(task_amt):,.0f}', f'{sheet_amt:,.0f}', 'UPDATE',
+                            target_doctype=TASK, target_field='custom_deliverable_amount',
+                            target_name=matched_task['name'],
+                        ))
+                    elif task_amt:
+                        results.append(_result(
+                            proj_id, sheet_name, f'{row_label} — vs Task amount',
+                            f'{float(task_amt):,.0f}', f'{sheet_amt:,.0f}', 'MATCH',
+                            target_doctype=TASK, target_field='custom_deliverable_amount',
+                        ))
                 else:
                     results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — deliverable',
+                        proj_id, sheet_name, f'{row_label} — vs Task name',
                         '(no matching Task)', row['deliverable'], 'CREATE',
-                        'Task not found in ERP',
+                        'Task not found',
                         target_doctype=TASK, target_field='subject',
                     ))
+                    if row.get('amount'):
+                        results.append(_result(
+                            proj_id, sheet_name, f'{row_label} — vs Task amount',
+                            '(no Task)', row['amount'], 'CREATE',
+                            target_doctype=TASK, target_field='custom_deliverable_amount',
+                        ))
             else:
                 results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — deliverable',
+                    proj_id, sheet_name, f'{row_label} — vs Task name',
                     '(no Tasks)', row['deliverable'], 'CREATE',
-                    'No Tasks exist for this project',
+                    'No Tasks for this project',
                     target_doctype=TASK, target_field='subject',
                 ))
+                if row.get('amount'):
+                    results.append(_result(
+                        proj_id, sheet_name, f'{row_label} — vs Task amount',
+                        '(no Tasks)', row['amount'], 'CREATE',
+                        target_doctype=TASK, target_field='custom_deliverable_amount',
+                    ))
 
-        if row.get('amount'):
-            results.append(_result(
-                proj_id, sheet_name, f'{row_label} — deliverable amount',
-                '', row['amount'], 'MATCH' if has_tasks else 'CREATE',
-                target_doctype=TASK, target_field='custom_deliverable_amount',
-            ))
-        else:
-            results.append(_result(
-                proj_id, sheet_name, f'{row_label} — deliverable amount',
-                '', '(empty)', 'MANDATORY_EMPTY', 'Deliverable amount missing',
-                target_doctype=TASK, target_field='custom_deliverable_amount',
-            ))
-
+        # Other deliverable fields
         if row.get('planned_date'):
             results.append(_result(
                 proj_id, sheet_name, f'{row_label} — planned date',
@@ -1180,96 +1335,6 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
                 target_doctype=TASK, target_field='custom_invoice_payment_status',
             ))
 
-        if row.get('actual_date'):
-            results.append(_result(
-                proj_id, sheet_name, f'{row_label} — actual invoicing date',
-                '', row['actual_date'], 'MATCH' if row_status else 'NO_STATUS',
-                target_doctype=TASK, target_field='custom_actual_invoice_date',
-            ))
-
-        # ── Invoice fields (target: Sales Invoice) ──
-        if inv_ref:
-            if matched_inv:
-                results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — invoice number',
-                    matched_inv['name'], inv_ref, 'MATCH',
-                    f'Matched {inv_ref} → {matched_inv["name"]}',
-                    target_doctype=SI, target_field='name',
-                ))
-
-                try:
-                    sheet_amt = float(row.get('invoice_amount') or 0)
-                    erp_amt = float(matched_inv.get('grand_total', 0))
-                    if abs(sheet_amt - erp_amt) > 1:
-                        results.append(_result(
-                            proj_id, sheet_name, f'{row_label} — invoice amount',
-                            f'{erp_amt:,.0f}', f'{sheet_amt:,.0f}', 'UPDATE',
-                            'Amount mismatch',
-                            target_doctype=SI, target_field='grand_total',
-                        ))
-                    else:
-                        results.append(_result(
-                            proj_id, sheet_name, f'{row_label} — invoice amount',
-                            f'{erp_amt:,.0f}', f'{sheet_amt:,.0f}', 'MATCH',
-                            target_doctype=SI, target_field='grand_total',
-                        ))
-                except (ValueError, TypeError):
-                    pass
-
-                erp_inv_status = matched_inv.get('status', '')
-                sheet_inv_status = row.get('invoice_status') or ''
-                if erp_inv_status or sheet_inv_status:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — invoice status',
-                        erp_inv_status, sheet_inv_status,
-                        'MATCH' if not sheet_inv_status or erp_inv_status.lower() == sheet_inv_status.lower() else 'UPDATE',
-                        target_doctype=SI, target_field='status',
-                    ))
-
-                erp_inv_date = matched_inv.get('posting_date', '')
-                sheet_inv_date = row.get('invoice_date') or ''
-                if erp_inv_date or sheet_inv_date:
-                    if erp_inv_date and sheet_inv_date and erp_inv_date != sheet_inv_date:
-                        results.append(_result(
-                            proj_id, sheet_name, f'{row_label} — invoice date',
-                            erp_inv_date, sheet_inv_date, 'UPDATE',
-                            target_doctype=SI, target_field='posting_date',
-                        ))
-                    elif erp_inv_date or sheet_inv_date:
-                        results.append(_result(
-                            proj_id, sheet_name, f'{row_label} — invoice date',
-                            erp_inv_date or '(empty)', sheet_inv_date or '(empty)', 'MATCH',
-                            target_doctype=SI, target_field='posting_date',
-                        ))
-            else:
-                results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — invoice number',
-                    '(not in ERP)', inv_ref, 'MISSING_IN_ERP',
-                    f'Invoice {inv_ref} not found',
-                    target_doctype=SI, target_field='name',
-                ))
-                if row.get('invoice_amount'):
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — invoice amount',
-                        '(not in ERP)', row['invoice_amount'], 'MISSING_IN_ERP',
-                        target_doctype=SI, target_field='grand_total',
-                    ))
-                if row.get('invoice_date'):
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — invoice date',
-                        '(not in ERP)', row['invoice_date'], 'MISSING_IN_ERP',
-                        target_doctype=SI, target_field='posting_date',
-                    ))
-        else:
-            if row.get('invoicing_status') and row['invoicing_status'] not in ('Not Invoiced',):
-                results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — invoice number',
-                    '', '(empty)', 'MANDATORY_EMPTY',
-                    f'Status is "{row["invoicing_status"]}" but no invoice number',
-                    target_doctype=SI, target_field='name',
-                ))
-
-        # payment date (target: Payment Entry)
         if row.get('payment_date'):
             results.append(_result(
                 proj_id, sheet_name, f'{row_label} — payment date',
@@ -1277,11 +1342,10 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks):
                 target_doctype='Payment Entry', target_field='posting_date',
             ))
 
-        # Row status
         if not row_status:
             results.append(_result(proj_id, sheet_name, f'{row_label} — row status',
                                    '', '', 'NO_STATUS', 'Row not reviewed',
-                                   target_doctype='Task'))
+                                   target_doctype=TASK))
 
     # ERP invoices not in sheet
     for inv in unmatched_erp:
