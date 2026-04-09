@@ -1,0 +1,6 @@
+workbook.xlsx
+backups/
+reports/
+__pycache__/
+*.pyc
+.env
