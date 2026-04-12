@@ -294,11 +294,15 @@ def validate_resources_planned(proj_id, sheet_rows, quotation, quot_note=''):
             matched_sheet.add(si)
 
             # Compare each field
+            # Rate in sheet = custom_discount_ on Quotation (stored as decimal e.g. 0.36 = 36%)
+            # ERP stores as percentage (36.0), so convert to decimal for comparison
+            quot_discount_pct = quotation.get('custom_discount_', 0) if quotation else 0
+            quot_discount_dec = quot_discount_pct / 100 if quot_discount_pct else 0
             field_pairs = [
                 ('ratio', sr.get('ratio'), er.get('percent'), 'percent'),
                 ('uom', sr.get('uom'), er.get('uom'), 'uom'),
                 ('qty', sr.get('qty'), er.get('qty'), 'qty'),
-                ('rate', sr.get('rate'), er.get('rate'), 'rate'),
+                ('rate', sr.get('rate'), quot_discount_dec, 'custom_discount_'),
             ]
 
             row_status = sr.get('status')

@@ -39,7 +39,7 @@ cd /Users/khalifah/Projects/sg/finance-data-migration
 
 | Sheet | ERP Module | Target Fields |
 |---|---|---|
-| 1. Project Info | `Project` | `workflow_state`, `custom_billability_type`, `custom_od_reference_`, `project_name`, `customer_name`, `custom_awarding_date`, `expected_start_date`, `expected_end_date`, `custom_partner_name_value`, `custom_engagement_manager`, `custom_end_client_name`, `custom_contractuals_link` |
+| 1. Project Info | `Project` | `workflow_state`, `custom_billability_type`, `custom_od_reference_`, `project_name`, `customer_name`, `custom_awarded_date`, `custom_official_start_date`, `official_end_date`, `custom_partner_name_value`, `custom_engagement_manager`, `custom_end_client_name`, `custom_contractuals_link` |
 | 2. Totals | (derived — never update directly) | Reconciliation check only |
 | 3. Resources (Planned) | `Quotation` → `custom_sg_resources_price` child table | `resources_level`, `percent`, `uom`, `qty`, `rate` |
 | 4. Resources (Actual) | `Project Employee Distribution` (PED) → `distribution_detail` child table | `employee_name`, `designation`, `from_date`, `to_date`, `ratio_` (note underscore) |
@@ -114,6 +114,39 @@ Deliverable milestones are stored as `Task` records linked to the Project. Key c
 - `custom_invoice_payment_status`, `custom_collection_status`
 - `custom_actual_payment_date`, `custom_expect_payment_date`
 - `custom_work_start_date`, `custom_actual_start_date`, `custom_actual_end_date`
+
+## Sheet 7: Two-Level Deliverables Validation
+Multiple sheet deliverables can map to one Sales Invoice. Validation works in two levels:
+
+### Level 1: Sheet deliverables vs Sales Invoice `items` child table
+- Group sheet deliverables by invoice ref
+- For each invoice: fetch SI detail, compare **count** (sheet deliverables vs SI items) and **amount sum**
+- Per deliverable: match by name against SI `items.description` (HTML stripped), compare individual amounts
+- This replaces the old per-row grand_total comparison that produced false UPDATEs
+
+### Level 2: Sheet deliverables vs Task doctype
+- Match each deliverable by name against Task `subject` or `custom_deliverable_name`
+- Compare `custom_deliverable_amount`
+- If no Task found → CREATE
+
+## Project Date Fields
+The Project doctype has TWO sets of date fields:
+- `expected_start_date` / `expected_end_date` — standard ERPNext fields (NOT what the sheet maps to)
+- `custom_official_start_date` / `official_end_date` — custom fields for official contract dates (Sheet 1 maps HERE)
+- `custom_awarded_date` — awarding date (NOT `custom_awarding_date`)
+
+## Quotation Lookup
+Quotation is found via: Project → opportunity → Quotation. If that fails (e.g., Quotation not linked to opportunity), falls back to direct lookup by sheet reference.
+- If Quotation exists but isn't linked to opportunity → note `NOT_LINKED`, still proceed with validation
+- If Quotation belongs to a different project → `BLOCKED`, skip all field comparisons
+
+## Expense Sources (Sheet 6)
+Expenses are read from **combined sources**, not PPI alone:
+1. PPI `project_expenses` — has line-item-level refs
+2. `Expense Claim` (submitted, linked to project)
+3. `Purchase Invoice` (submitted, linked to project)
+4. `Journal Entry Account` (linked to project)
+Merged by reference — source doctypes fill gaps where PPI is incomplete.
 
 ## Invoice Format Cross-Matching
 Sheet uses short format: `00331-2025` (sequence-year)
