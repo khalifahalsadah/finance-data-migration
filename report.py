@@ -48,7 +48,7 @@ def print_terminal_report(results, totals_reconciliation=None):
             action_counts[r.get('erp_action', 'SKIP')] += 1
 
         summary_parts = []
-        for s in ['UPDATE', 'CREATE', 'MATCH', 'MANDATORY_EMPTY', 'MISSING_IN_ERP',
+        for s in ['UPDATE', 'CREATE', 'TO_DELETE', 'MATCH', 'MANDATORY_EMPTY', 'MISSING_IN_ERP',
                    'MISSING_IN_SHEET', 'NO_STATUS', 'BLOCKED', 'RELEASE_RESOURCE']:
             if counts[s]:
                 summary_parts.append(f'{counts[s]} {s}')

@@ -100,6 +100,7 @@ def run_validation(wb_data, projects, erp):
             proj_id,
             wb_data['project_info'].get(proj_id, {}),
             erp_project,
+            erp,
         )
         all_results += validate_resources_planned(
             proj_id,
@@ -119,14 +120,14 @@ def run_validation(wb_data, projects, erp):
             quot_note,
         )
         try:
-            combined_expenses = erp.get_expenses_for_project(proj_id)
+            gl_expenses = erp.get_gl_expenses(proj_id)
         except Exception:
-            combined_expenses = {}
+            gl_expenses = []
 
         all_results += validate_thirdparty_actual(
             proj_id,
             wb_data['thirdparty_actual'].get(proj_id, []),
-            list(combined_expenses.values()),
+            gl_expenses,
         )
         all_results += validate_deliverables(
             proj_id,
@@ -295,12 +296,12 @@ def cmd_validate(args):
     print(f'\n{"=" * 70}')
     print(f'OVERALL: {len(results)} checks across {len(projects)} projects')
     print(f'\nBy Status:')
-    for s in ['UPDATE', 'CREATE', 'MATCH', 'MANDATORY_EMPTY', 'MISSING_IN_ERP',
+    for s in ['UPDATE', 'CREATE', 'TO_DELETE', 'MATCH', 'MANDATORY_EMPTY', 'MISSING_IN_ERP',
               'MISSING_IN_SHEET', 'NO_STATUS', 'BLOCKED', 'RELEASE_RESOURCE']:
         if counts[s]:
             print(f'  {s}: {counts[s]}')
     print(f'\nERP Actions if applied:')
-    for a in ['UPDATE', 'CREATE', 'SKIP']:
+    for a in ['UPDATE', 'CREATE', 'TO_DELETE', 'SKIP']:
         if action_counts[a]:
             print(f'  {a}: {action_counts[a]}')
 

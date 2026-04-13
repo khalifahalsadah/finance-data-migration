@@ -128,98 +128,61 @@ class ERPClient:
             limit=100,
         )
 
-    # ── Expenses (combined from source doctypes + PPI) ─────────
+    # ── Expenses from GL Entry ──────────────────────────────────
 
-    def get_expenses_for_project(self, proj_id):
-        """Get all expenses from source doctypes + PPI, merged by reference.
-        Returns dict keyed by reference form name.
+    def get_gl_expenses(self, proj_id):
+        """Get project expenses from General Ledger, grouped by account.
+        GL Entry is the single source of truth — aggregates from all source doctypes.
+        Returns list of dicts with account, net amount, voucher details.
         """
-        expenses = {}
+        entries = self._get_list(
+            'GL Entry',
+            filters=[['project', '=', proj_id]],
+            fields=['account', 'debit', 'credit', 'voucher_type', 'voucher_no', 'posting_date'],
+            limit=500,
+        )
 
-        # 1. PPI project_expenses (has the most detail including child doc refs)
-        try:
-            ppi = self.get_ppi(proj_id)
-            for e in ppi.get('project_expenses', []):
-                ref = e.get('reference_form', '')
-                if ref:
-                    expenses[ref] = {
-                        'reference_form': ref,
-                        'reference_doctype': e.get('reference_doctype', ''),
-                        'total': e.get('total', 0),
-                        'form_date': e.get('form_date', ''),
-                        'child_table_value': e.get('child_table_value', ''),
-                        'source': 'PPI',
-                    }
-        except Exception:
-            pass
+        # Group by account
+        from collections import defaultdict
+        by_account = defaultdict(lambda: {'debit': 0, 'credit': 0, 'vouchers': []})
+        for e in entries:
+            acc = e['account']
+            by_account[acc]['debit'] += e.get('debit', 0)
+            by_account[acc]['credit'] += e.get('credit', 0)
+            by_account[acc]['vouchers'].append({
+                'voucher_type': e.get('voucher_type', ''),
+                'voucher_no': e.get('voucher_no', ''),
+                'posting_date': e.get('posting_date', ''),
+                'debit': e.get('debit', 0),
+                'credit': e.get('credit', 0),
+            })
 
-        # 2. Expense Claims (submitted)
-        try:
-            ecs = self._get_list(
-                'Expense Claim',
-                filters=[['project', '=', proj_id], ['docstatus', '=', 1]],
-                fields=['name', 'total_claimed_amount', 'posting_date', 'employee_name'],
-                limit=100,
-            )
-            for ec in ecs:
-                ref = ec['name']
-                if ref not in expenses:
-                    expenses[ref] = {
-                        'reference_form': ref,
-                        'reference_doctype': 'Expense Claim',
-                        'total': ec.get('total_claimed_amount', 0),
-                        'form_date': ec.get('posting_date', ''),
-                        'child_table_value': ec.get('employee_name', ''),
-                        'source': 'Expense Claim',
-                    }
-        except Exception:
-            pass
+        # Return expense accounts (5xxx) with net amounts
+        results = []
+        for acc, vals in sorted(by_account.items()):
+            net = vals['debit'] - vals['credit']
+            results.append({
+                'account': acc,
+                'net_amount': net,
+                'debit': vals['debit'],
+                'credit': vals['credit'],
+                'vouchers': vals['vouchers'],
+            })
+        return results
 
-        # 3. Purchase Invoices (submitted, linked to project)
-        try:
-            pis = self._get_list(
-                'Purchase Invoice',
-                filters=[['project', '=', proj_id], ['docstatus', '=', 1]],
-                fields=['name', 'grand_total', 'posting_date', 'supplier_name'],
-                limit=100,
-            )
-            for pi in pis:
-                ref = pi['name']
-                if ref not in expenses:
-                    expenses[ref] = {
-                        'reference_form': ref,
-                        'reference_doctype': 'Purchase Invoice',
-                        'total': pi.get('grand_total', 0),
-                        'form_date': pi.get('posting_date', ''),
-                        'child_table_value': pi.get('supplier_name', ''),
-                        'source': 'Purchase Invoice',
-                    }
-        except Exception:
-            pass
+    # ── Customer lookup ──────────────────────────────────────────
 
-        # 4. Journal Entries (via Journal Entry Account child table)
-        try:
-            je_accounts = self._get_list(
-                'Journal Entry Account',
-                filters=[['project', '=', proj_id]],
-                fields=['parent', 'debit_in_account_currency', 'account'],
-                limit=100,
-            )
-            for ja in je_accounts:
-                ref = ja['parent']
-                if ref not in expenses and ja.get('debit_in_account_currency', 0) > 0:
-                    expenses[ref] = {
-                        'reference_form': ref,
-                        'reference_doctype': 'Journal Entry',
-                        'total': ja.get('debit_in_account_currency', 0),
-                        'form_date': '',
-                        'child_table_value': ja.get('account', ''),
-                        'source': 'Journal Entry',
-                    }
-        except Exception:
-            pass
-
-        return expenses
+    def find_customer(self, name_query):
+        """Find closest Customer record by name. Returns (customer_id, customer_name) or None."""
+        customers = self._get_list(
+            'Customer',
+            filters=[['customer_name', 'like', f'%{name_query}%']],
+            fields=['name', 'customer_name'],
+            limit=5,
+        )
+        if customers:
+            return customers[0]['name'], customers[0]['customer_name']
+        return None, None
 
     # ── Task (deliverables) ─────────────────────────────────────
 

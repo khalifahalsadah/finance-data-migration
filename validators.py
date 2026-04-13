@@ -17,6 +17,7 @@ def _erp_action(status):
     return {
         'UPDATE': 'UPDATE',
         'CREATE': 'CREATE',
+        'TO_DELETE': 'TO_DELETE',
         'MATCH': 'SKIP',
         'NO_STATUS': 'SKIP',
         'MANDATORY_EMPTY': 'SKIP',
@@ -177,7 +178,7 @@ def _compare_field(project, sheet, field_label, erp_live, sheet_effective, sheet
 
 # ── Sheet 1: Project Info ────────────────────────────────────────────────────
 
-def validate_project_info(proj_id, sheet_fields, erp_project):
+def validate_project_info(proj_id, sheet_fields, erp_project, erp_client=None):
     results = []
     sheet_name = '1. Project Info'
 
@@ -191,6 +192,24 @@ def validate_project_info(proj_id, sheet_fields, erp_project):
         erp_live = erp_project.get(api_field, '')
         effective = field_data['effective_val']
         status = field_data['status']
+
+        # Special validation for customer_name — should match Customer doctype
+        if api_field == 'customer_name' and effective and erp_client:
+            cust_id, cust_name = erp_client.find_customer(effective)
+            if cust_name and cust_name.lower().strip() != effective.lower().strip():
+                results.append(_result(
+                    proj_id, sheet_name, f'{label} (Customer lookup)',
+                    f'{cust_id}: {cust_name}', effective,
+                    'UPDATE', f'Sheet says "{effective}", closest Customer is "{cust_name}" ({cust_id})',
+                    target_doctype='Project', target_field='customer',
+                ))
+            elif not cust_id:
+                results.append(_result(
+                    proj_id, sheet_name, f'{label} (Customer lookup)',
+                    '(not found)', effective,
+                    'BLOCKED', f'No Customer matching "{effective}" in ERP',
+                    target_doctype='Customer',
+                ))
 
         # Special validation for workflow_state
         if api_field == 'workflow_state' and effective and effective not in VALID_WORKFLOW_STATES:
@@ -570,20 +589,22 @@ def validate_resources_actual(proj_id, sheet_rows, ped_details):
                                        '', '', 'NO_STATUS', 'Row not reviewed',
                                        row_num=si + 1))
 
-    # PED rows not in sheet — show each field
+    # PED rows not in sheet — assume correct per Yazeed's feedback
     for pi, pd in enumerate(ped_details):
         if pi not in matched_ped:
             ped_label = f'{pd["employee_name"]} ({pd["from_date"]})'
-            for field_name, ped_field in [('name', 'employee_name'), ('role', 'designation'),
-                                           ('start', 'from_date'), ('end', 'to_date'),
-                                           ('ratio', 'ratio_')]:
-                e_val = str(pd.get(ped_field) or '').strip()
-                if e_val:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{ped_label} — {field_name}',
-                        e_val, '(not in sheet)',
-                        'MISSING_IN_SHEET', 'PED row not in sheet',
-                    ))
+            # Check if Egypt employee (SG-E-*)
+            emp_id = pd.get('employee', '')
+            is_egypt = emp_id.startswith('SG-E-') if emp_id else False
+            note = 'PED row not in sheet — assumed correct'
+            if is_egypt:
+                note += ' (Egypt employee)'
+            results.append(_result(
+                proj_id, sheet_name, f'{ped_label} — (in ERP, not in sheet)',
+                f'ratio={pd.get("ratio_", "?")}', '(assumed correct)',
+                'MATCH', note,
+                target_doctype='Project Employee Distribution',
+            ))
 
     # Cancelled rows
     for cr in cancelled_rows:
@@ -790,21 +811,24 @@ def validate_thirdparty_planned(proj_id, sheet_rows, quotation, quot_note=''):
             results.append(_result(proj_id, sheet_name, f'{row_label} — row status',
                                    '', '', 'NO_STATUS', 'Row not reviewed'))
 
-    # ERP rows not in sheet — show each field
+    # ERP rows not in sheet — mark as TO_DELETE (not in sheet = assumed removed)
     for ei, er in enumerate(erp_3p):
         if ei not in matched_erp:
             erp_label = f'{er["entry_type"]} / {er["description"]}'
-            has_value = False
-            for field_name, erp_key in [('entry_type', 'entry_type'), ('description', 'description'),
-                                         ('rate', 'rate'), ('qty', 'qty'), ('total', 'total')]:
-                e_val = er.get(erp_key)
-                if e_val and float(e_val or 0) != 0 if isinstance(e_val, (int, float)) else e_val:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{erp_label} — {field_name}',
-                        str(e_val), '(not in sheet)',
-                        'MISSING_IN_SHEET', 'Quotation entry not in sheet',
-                    ))
-                    has_value = True
+            e_total = er.get('total', 0)
+            if e_total and float(e_total) != 0:
+                results.append(_result(
+                    proj_id, sheet_name, f'{erp_label}',
+                    str(e_total), '(removed from sheet)',
+                    'TO_DELETE', 'In ERP but not in sheet — marked for deletion',
+                    target_doctype='Quotation', target_field=er.get('_table', ''),
+                ))
+            else:
+                results.append(_result(
+                    proj_id, sheet_name, f'{erp_label}',
+                    '(zero/empty)', '(not in sheet)',
+                    'MATCH', 'Empty row in both',
+                ))
 
     return results
 
@@ -866,204 +890,121 @@ def _resolve_expense_doctype(ref):
 
 # ── Sheet 6: Third-Party Actual ──────────────────────────────────────────────
 
-def validate_thirdparty_actual(proj_id, sheet_rows, ppi_expenses):
+def validate_thirdparty_actual(proj_id, sheet_rows, gl_expenses):
+    """Validate Sheet 6 against GL Entry (source of truth for expenses).
+    gl_expenses: list of dicts with account, net_amount, debit, credit, vouchers.
+    """
     results = []
     sheet_name = '6. Third-Party (Actual)'
+    GL = 'GL Entry'
 
     data_rows = [r for r in sheet_rows
                  if r.get('vendor') or (r.get('amount') and r['amount'] not in ('0', '0.0'))]
     empty_rows = [r for r in sheet_rows if not r.get('vendor') and not r.get('amount')]
 
-    # Build ref maps — match by invoice/expense reference
-    erp_refs = {}
-    for e in ppi_expenses:
-        erp_refs[e['reference_form']] = e
+    # GL expense accounts (5xxx = expenses)
+    gl_expense_accounts = [g for g in gl_expenses if g['account'].startswith('5') and abs(g['net_amount']) > 0.01]
+    gl_total = sum(g['net_amount'] for g in gl_expense_accounts)
 
-    # Match sheet rows to ERP by reference
-    matched_erp = set()
+    # Sheet total
+    sheet_total = 0
+    for r in data_rows:
+        try:
+            sheet_total += float(r.get('amount') or 0)
+        except (ValueError, TypeError):
+            pass
 
+    # Overall total comparison
+    if data_rows or gl_expense_accounts:
+        if abs(sheet_total - gl_total) < 1:
+            results.append(_result(
+                proj_id, sheet_name, 'Total expenses',
+                f'{gl_total:,.2f}', f'{sheet_total:,.2f}', 'MATCH',
+                target_doctype=GL, target_field='account (5xxx)',
+            ))
+        else:
+            results.append(_result(
+                proj_id, sheet_name, 'Total expenses',
+                f'{gl_total:,.2f}', f'{sheet_total:,.2f}', 'UPDATE',
+                f'GL total={gl_total:,.2f}, Sheet total={sheet_total:,.2f}',
+                target_doctype=GL, target_field='account (5xxx)',
+            ))
+
+    # Per GL account breakdown
+    for g in gl_expense_accounts:
+        acc_name = g['account']
+        results.append(_result(
+            proj_id, sheet_name, f'GL: {acc_name}',
+            f'{g["net_amount"]:,.2f}', '', 'MATCH',
+            f'Debit={g["debit"]:,.2f} Credit={g["credit"]:,.2f}',
+            target_doctype=GL, target_field='account',
+        ))
+
+    # Per sheet row — show with status and reference
     for i, sr in enumerate(data_rows, 1):
-        ref = sr.get('ref')
+        ref = sr.get('ref') or ''
         row_status = sr.get('status')
         vendor_display = (sr.get('vendor') or '?')[:30]
         row_label = f'Row {i} ({ref or "no ref"} / {vendor_display})'
+        row_doctype = _resolve_expense_doctype(ref)
 
-        er = erp_refs.get(ref) if ref else None
-        if er:
-            matched_erp.add(ref)
-
-        # Resolve the actual ERP doctype from the reference prefix or ERP data
-        if er:
-            row_doctype = er.get('reference_doctype', '') or _resolve_expense_doctype(ref)
-        else:
-            row_doctype = _resolve_expense_doctype(ref)
-
-        # Field-by-field comparison
-        field_pairs = [
-            ('cost_type', None, 'reference_doctype'),
-            ('vendor', er.get('child_table_value', '') if er else '', 'description'),
-            ('ref', er.get('reference_form', '') if er else '', 'name'),
-            ('amount', str(er.get('total', '')) if er else '', 'total'),
-            ('date', er.get('form_date', '') if er else '', 'posting_date'),
-        ]
-
-        for field_name, e_val, erp_api_field in field_pairs:
+        # Show each field
+        for field_name in ['cost_type', 'vendor', 'ref', 'amount', 'date']:
             if field_name == 'cost_type':
                 ct = sr.get('cost_type') or ''
-                if er:
-                    e_doctype = er.get('reference_doctype', '')
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — cost_type',
-                        e_doctype, ct, 'MATCH' if ct else 'NO_STATUS',
-                        target_doctype=row_doctype, target_field='reference_doctype',
-                    ))
-                elif ct:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — cost_type',
-                        '(not in ERP)', ct, 'CREATE' if ref else 'MISSING_IN_ERP',
-                        target_doctype=row_doctype, target_field='reference_doctype',
-                    ))
+                results.append(_result(
+                    proj_id, sheet_name, f'{row_label} — cost_type',
+                    row_doctype or '(unknown)', ct, 'MATCH' if ct else 'NO_STATUS',
+                    target_doctype=row_doctype or GL, target_field='voucher_type',
+                ))
                 continue
 
-            e_str = str(e_val).strip() if e_val else ''
             s_corr = str(sr.get(f'{field_name}_corr') or '').strip()
             s_erp_col = str(sr.get(f'{field_name}_erp') or '').strip()
+            sheet_val = s_corr or s_erp_col or ''
 
-            if s_corr:
-                _compare_3p_actual_field(
-                    results, proj_id, sheet_name, row_label,
-                    field_name, e_str, s_corr, row_status, erp_api_field,
-                    row_doctype,
-                )
-            elif row_status == 'Confirmed':
-                _compare_3p_actual_field(
-                    results, proj_id, sheet_name, row_label,
-                    field_name, e_str, s_erp_col, row_status, erp_api_field,
-                    row_doctype,
-                )
-            else:
-                if s_erp_col and s_erp_col != 'not found':
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — {field_name}',
-                        e_str or '(empty)', f'(not reviewed) ERP col={s_erp_col}',
-                        'NO_STATUS', 'Corrected column empty, no status set',
-                        target_doctype=row_doctype, target_field=erp_api_field,
-                    ))
-                elif e_str:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — {field_name}',
-                        e_str, '(not reviewed)',
-                        'NO_STATUS', 'Corrected column empty, no status set',
-                        target_doctype=row_doctype, target_field=erp_api_field,
-                    ))
-                elif not er:
-                    results.append(_result(
-                        proj_id, sheet_name, f'{row_label} — {field_name}',
-                        '(not in ERP)', '(empty)',
-                        'MANDATORY_EMPTY', f'{field_name} missing',
-                        target_doctype=row_doctype, target_field=erp_api_field,
-                    ))
+            if row_status in ('Confirmed', 'Corrected') and sheet_val:
+                results.append(_result(
+                    proj_id, sheet_name, f'{row_label} — {field_name}',
+                    '', sheet_val, 'MATCH' if row_status == 'Confirmed' else 'UPDATE',
+                    target_doctype=row_doctype or GL,
+                    target_field={'vendor': 'description', 'ref': 'voucher_no', 'amount': 'debit', 'date': 'posting_date'}.get(field_name, field_name),
+                ))
+            elif sheet_val:
+                results.append(_result(
+                    proj_id, sheet_name, f'{row_label} — {field_name}',
+                    '', f'(not reviewed) {sheet_val}',
+                    'NO_STATUS', 'Corrected column empty, no status set',
+                    target_doctype=row_doctype or GL,
+                ))
 
-        # Row status check
         if not row_status:
             results.append(_result(proj_id, sheet_name, f'{row_label} — row status',
                                    '', '', 'NO_STATUS', 'Row not reviewed',
-                                   target_doctype=row_doctype))
+                                   target_doctype=row_doctype or GL))
 
-    # ERP expenses not in sheet — show each field with resolved doctype
-    for ref, er in erp_refs.items():
-        if ref not in matched_erp:
-            erp_label = f'{ref}'
-            erp_doctype = er.get('reference_doctype', '') or _resolve_expense_doctype(ref)
-            for field_name, erp_key, target_f in [
-                ('ref', 'reference_form', 'name'),
-                ('doctype', 'reference_doctype', 'reference_doctype'),
-                ('amount', 'total', 'total'),
-                ('date', 'form_date', 'posting_date'),
-            ]:
-                e_val = er.get(erp_key)
-                if e_val:
-                    e_display = f'{e_val:,.2f}' if isinstance(e_val, (int, float)) else str(e_val)
-                    results.append(_result(
-                        proj_id, sheet_name, f'{erp_label} — {field_name}',
-                        e_display, '(not in sheet)',
-                        'MISSING_IN_SHEET', 'ERP expense not in sheet',
-                        target_doctype=erp_doctype, target_field=target_f,
-                    ))
-
-    # Empty rows handling
-    if not data_rows and not ppi_expenses:
+    # Empty handling
+    if not data_rows and not gl_expense_accounts:
         confirmed_empty = [r for r in empty_rows if r.get('status') == 'Confirmed']
         if confirmed_empty:
             results.append(_result(proj_id, sheet_name, '(all)', '', '',
-                                   'MATCH', 'No third-party costs (confirmed)'))
+                                   'MATCH', 'No third-party costs (confirmed)',
+                                   target_doctype=GL))
         elif empty_rows:
             results.append(_result(proj_id, sheet_name, '(all)', '', '',
-                                   'NO_STATUS', 'Empty rows not reviewed'))
+                                   'NO_STATUS', 'Empty rows not reviewed',
+                                   target_doctype=GL))
         else:
             results.append(_result(proj_id, sheet_name, '(all)', '', '',
-                                   'MANDATORY_EMPTY', 'No data in sheet or ERP'))
-    elif not data_rows and ppi_expenses:
-        for ref, er in erp_refs.items():
-            erp_label = f'{ref}'
-            erp_doctype = er.get('reference_doctype', '') or _resolve_expense_doctype(ref)
-            for field_name, erp_key, target_f in [
-                ('ref', 'reference_form', 'name'),
-                ('amount', 'total', 'total'),
-                ('date', 'form_date', 'posting_date'),
-            ]:
-                e_val = er.get(erp_key)
-                if e_val:
-                    e_display = f'{e_val:,.2f}' if isinstance(e_val, (int, float)) else str(e_val)
-                    results.append(_result(
-                        proj_id, sheet_name, f'{erp_label} — {field_name}',
-                        e_display, '(not in sheet)',
-                        'MISSING_IN_SHEET', 'ERP expense not in sheet',
-                        target_doctype=erp_doctype, target_field=target_f,
-                    ))
+                                   'MANDATORY_EMPTY', 'No data in sheet or GL',
+                                   target_doctype=GL))
+    elif not data_rows and gl_expense_accounts:
+        results.append(_result(proj_id, sheet_name, '(all)',
+                               f'{len(gl_expense_accounts)} GL accounts ({gl_total:,.2f})', '',
+                               'MISSING_IN_SHEET', f'Sheet empty but GL has {gl_total:,.2f} in expenses',
+                               target_doctype=GL))
 
     return results
-
-
-def _compare_3p_actual_field(results, proj_id, sheet_name, row_label,
-                              field_name, erp_live, sheet_val, row_status, erp_api_field,
-                              target_doctype=''):
-    """Compare a single third-party actual field against PPI expense."""
-    e_str = erp_live or ''
-    s_str = sheet_val or ''
-
-    try:
-        s_num = float(s_str) if s_str else None
-        e_num = float(e_str) if e_str else None
-        if s_num is not None and e_num is not None:
-            if abs(s_num - e_num) > 0.01:
-                results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — {field_name}',
-                    e_str, s_str, 'UPDATE', '',
-                    target_doctype=target_doctype, target_field=erp_api_field,
-                ))
-            else:
-                results.append(_result(
-                    proj_id, sheet_name, f'{row_label} — {field_name}',
-                    e_str, s_str, 'MATCH',
-                    target_doctype=target_doctype, target_field=erp_api_field,
-                ))
-            return
-    except (ValueError, TypeError):
-        pass
-
-    if s_str and e_str and s_str.lower().strip() != e_str.lower().strip():
-        results.append(_result(
-            proj_id, sheet_name, f'{row_label} — {field_name}',
-            e_str, s_str, 'UPDATE', '',
-            target_doctype=target_doctype, target_field=erp_api_field,
-        ))
-    elif s_str or e_str:
-        results.append(_result(
-            proj_id, sheet_name, f'{row_label} — {field_name}',
-            e_str or '(empty)', s_str or '(empty)', 'MATCH',
-            target_doctype=target_doctype, target_field=erp_api_field,
-        ))
 
 
 # ── Sheet 7: Deliverables & Invoices ─────────────────────────────────────────
@@ -1318,18 +1259,20 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_clie
                         target_doctype=TASK, target_field='custom_deliverable_amount',
                     ))
 
-        # Other deliverable fields
+        # Other deliverable fields — CREATE if no Task, MATCH if Task exists
+        task_status = 'MATCH' if has_tasks and row_status else ('CREATE' if not has_tasks else 'NO_STATUS')
+
         if row.get('planned_date'):
             results.append(_result(
                 proj_id, sheet_name, f'{row_label} — planned date',
-                '', row['planned_date'], 'MATCH' if row_status else 'NO_STATUS',
+                '', row['planned_date'], task_status,
                 target_doctype=TASK, target_field='custom_estimated_invoice_date',
             ))
 
         if row.get('invoicing_status'):
             results.append(_result(
                 proj_id, sheet_name, f'{row_label} — invoicing status',
-                '', row['invoicing_status'], 'MATCH' if row_status else 'NO_STATUS',
+                '', row['invoicing_status'], task_status,
                 target_doctype=TASK, target_field='custom_invoice_payment_status',
             ))
         else:
@@ -1342,7 +1285,7 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_clie
         if row.get('payment_date'):
             results.append(_result(
                 proj_id, sheet_name, f'{row_label} — payment date',
-                '', row['payment_date'], 'MATCH' if row_status else 'NO_STATUS',
+                '', row['payment_date'], task_status,
                 target_doctype='Payment Entry', target_field='posting_date',
             ))
 
