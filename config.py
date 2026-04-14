@@ -1,6 +1,6 @@
 """Configuration constants and field mappings for finance data migration."""
 
-ERP_BASE = 'https://engine.strategicgears.com'
+ERP_BASE = 'https://strategicgears-uat.frappe.cloud'
 ERP_TOKEN = '96abe3a71ba471f:d82538d96d9c305'
 
 # SharePoint / OneDrive
@@ -29,8 +29,8 @@ PROJECT_FIELDS = [
     (29, 30, 31, 'Official Start Date', 'custom_official_start_date'),
     (32, 33, 34, 'Official End Date', 'official_end_date'),
     (35, 36, 37, 'Contractuals Link', 'custom_contractuals_link'),
-    (38, 39, 40, 'Partner', 'custom_partner_name_value'),
-    (41, 42, 43, 'Engagement Manager', 'custom_engagement_manager'),
+    (38, 39, 40, 'Partner', 'project_lead_name'),
+    (41, 42, 43, 'Engagement Manager', 'project_manager_name'),
 ]
 
 # Sheet 3: Resources Planned column positions

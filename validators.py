@@ -51,8 +51,8 @@ FIELD_LABEL_TO_API = {
     'Official Start Date': 'custom_official_start_date',
     'Official End Date': 'official_end_date',
     'Contractuals Link': 'custom_contractuals_link',
-    'Partner': 'custom_partner_name_value',
-    'Engagement Manager': 'custom_engagement_manager',
+    'Partner': 'project_lead_name',
+    'Engagement Manager': 'project_manager_name',
     # Sheet 3
     'ratio': 'custom_sg_resources_price.percent',
     'uom': 'custom_sg_resources_price.uom',
@@ -193,22 +193,46 @@ def validate_project_info(proj_id, sheet_fields, erp_project, erp_client=None):
         effective = field_data['effective_val']
         status = field_data['status']
 
-        # Special validation for customer_name — should match Customer doctype
-        if api_field == 'customer_name' and effective and erp_client:
-            cust_id, cust_name = erp_client.find_customer(effective)
-            if cust_name and cust_name.lower().strip() != effective.lower().strip():
+        # Special validation for customer_name — check against Project's linked Customer
+        if api_field == 'customer_name' and effective:
+            erp_customer_id = erp_project.get('customer', '')
+            erp_customer_name = erp_project.get('customer_name', '')
+            if erp_customer_name and erp_customer_name.lower().strip() != effective.lower().strip():
                 results.append(_result(
-                    proj_id, sheet_name, f'{label} (Customer lookup)',
-                    f'{cust_id}: {cust_name}', effective,
-                    'UPDATE', f'Sheet says "{effective}", closest Customer is "{cust_name}" ({cust_id})',
+                    proj_id, sheet_name, f'{label} (Customer: {erp_customer_id})',
+                    erp_customer_name, effective,
+                    'UPDATE', f'ERP Customer is "{erp_customer_name}" ({erp_customer_id}), sheet says "{effective}"',
                     target_doctype='Project', target_field='customer',
                 ))
-            elif not cust_id:
+            elif not erp_customer_id and effective and erp_client:
+                # No customer linked — try to find one
+                cust_id, cust_name = erp_client.find_customer(effective)
+                if cust_id:
+                    results.append(_result(
+                        proj_id, sheet_name, f'{label} (Customer lookup)',
+                        f'{cust_id}: {cust_name}', effective,
+                        'UPDATE', f'Project has no customer linked, found {cust_id}',
+                        target_doctype='Project', target_field='customer',
+                    ))
+                else:
+                    results.append(_result(
+                        proj_id, sheet_name, f'{label} (Customer lookup)',
+                        '(not found)', effective,
+                        'BLOCKED', f'No Customer matching "{effective}" in ERP',
+                        target_doctype='Customer',
+                    ))
+
+        # Special validation for Partner/EM — check if Employee lookup is needed
+        if api_field in ('project_lead_name', 'project_manager_name') and effective:
+            emp_id_field = 'project_lead' if api_field == 'project_lead_name' else 'project_manager'
+            erp_emp_id = erp_project.get(emp_id_field, '')
+            if not erp_emp_id and effective:
+                # Need to find the employee
                 results.append(_result(
-                    proj_id, sheet_name, f'{label} (Customer lookup)',
-                    '(not found)', effective,
-                    'BLOCKED', f'No Customer matching "{effective}" in ERP',
-                    target_doctype='Customer',
+                    proj_id, sheet_name, f'{label} (Employee lookup)',
+                    '(no employee linked)', effective,
+                    'UPDATE', f'Need to link Employee for "{effective}"',
+                    target_doctype='Project', target_field=emp_id_field,
                 ))
 
         # Special validation for workflow_state
@@ -924,9 +948,9 @@ def validate_thirdparty_actual(proj_id, sheet_rows, gl_expenses):
             ))
         else:
             results.append(_result(
-                proj_id, sheet_name, 'Total expenses',
-                f'{gl_total:,.2f}', f'{sheet_total:,.2f}', 'UPDATE',
-                f'GL total={gl_total:,.2f}, Sheet total={sheet_total:,.2f}',
+                proj_id, sheet_name, 'Total expenses (MISMATCH)',
+                f'{gl_total:,.2f}', f'{sheet_total:,.2f}', 'MISSING_IN_SHEET',
+                f'GL is source of truth ({gl_total:,.2f}), sheet shows {sheet_total:,.2f} — GL is read-only',
                 target_doctype=GL, target_field='account (5xxx)',
             ))
 
@@ -964,9 +988,10 @@ def validate_thirdparty_actual(proj_id, sheet_rows, gl_expenses):
             sheet_val = s_corr or s_erp_col or ''
 
             if row_status in ('Confirmed', 'Corrected') and sheet_val:
+                # GL is read-only — never UPDATE, only MATCH for informational purposes
                 results.append(_result(
                     proj_id, sheet_name, f'{row_label} — {field_name}',
-                    '', sheet_val, 'MATCH' if row_status == 'Confirmed' else 'UPDATE',
+                    '', sheet_val, 'MATCH',
                     target_doctype=row_doctype or GL,
                     target_field={'vendor': 'description', 'ref': 'voucher_no', 'amount': 'debit', 'date': 'posting_date'}.get(field_name, field_name),
                 ))
@@ -1119,8 +1144,8 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_clie
         else:
             results.append(_result(
                 proj_id, sheet_name, f'{inv_label} — deliverable count',
-                str(si_count), str(sheet_count), 'UPDATE',
-                f'Sheet has {sheet_count}, SI has {si_count}',
+                str(si_count), str(sheet_count), 'MISSING_IN_SHEET',
+                f'Sheet has {sheet_count}, SI has {si_count} — SI is read-only',
                 target_doctype=SI, target_field='items',
             ))
 
@@ -1136,8 +1161,8 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_clie
         else:
             results.append(_result(
                 proj_id, sheet_name, f'{inv_label} — amount sum',
-                f'{si_sum:,.0f}', f'{sheet_sum:,.0f}', 'UPDATE',
-                f'Sum mismatch: SI items={si_sum:,.0f}, Sheet={sheet_sum:,.0f}',
+                f'{si_sum:,.0f}', f'{sheet_sum:,.0f}', 'MISSING_IN_SHEET',
+                f'Sum mismatch: SI={si_sum:,.0f}, Sheet={sheet_sum:,.0f} — SI is read-only',
                 target_doctype=SI, target_field='items.amount',
             ))
 
@@ -1178,7 +1203,8 @@ def validate_deliverables(proj_id, sheet_rows, erp_invoices, erp_tasks, erp_clie
                 else:
                     results.append(_result(
                         proj_id, sheet_name, f'{sd_label} — vs SI item amount',
-                        f'{si_amt:,.0f}', f'{sd_amt:,.0f}', 'UPDATE',
+                        f'{si_amt:,.0f}', f'{sd_amt:,.0f}', 'MISSING_IN_SHEET',
+                        'Amount mismatch — SI is read-only',
                         target_doctype=SI, target_field='items.amount',
                     ))
             else:

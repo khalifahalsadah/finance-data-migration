@@ -3,6 +3,12 @@
 ## Purpose
 Validates and syncs project financial data between an Excel workbook (maintained by Finance team) and ERPNext. Compares every field in every sheet against live ERP data, generates a detailed report, and can apply corrections with full backup/restore capability.
 
+## Current Status (2026-04-14)
+- **Environment**: UAT (`https://strategicgears-uat.frappe.cloud`)
+- **Batch 1**: Validated and approved by Yazeed (v4). Ready for apply on UAT.
+- **Batch 2**: Validated, not yet reviewed.
+- **Apply logic**: Project fields (Sheet 1) and PED (Sheet 4) working. Task creation (Sheet 7), Quotation updates (Sheet 3/5), and tax handling still need implementation.
+
 ## Source Data
 - **Excel workbook**: `Project_Data_Completion_Templates_v3.xlsx` on Yazeed Alsughayyir's OneDrive
 - **File ID**: `8B8607E9-7CA6-4384-957F-29E09FCFBE43`
@@ -140,13 +146,44 @@ Quotation is found via: Project → opportunity → Quotation. If that fails (e.
 - If Quotation exists but isn't linked to opportunity → note `NOT_LINKED`, still proceed with validation
 - If Quotation belongs to a different project → `BLOCKED`, skip all field comparisons
 
-## Expense Sources (Sheet 6)
-Expenses are read from **combined sources**, not PPI alone:
-1. PPI `project_expenses` — has line-item-level refs
-2. `Expense Claim` (submitted, linked to project)
-3. `Purchase Invoice` (submitted, linked to project)
-4. `Journal Entry Account` (linked to project)
-Merged by reference — source doctypes fill gaps where PPI is incomplete.
+## Expense Sources (Sheet 6) — GL Entry
+Expenses use **GL Entry** as the single source of truth (per Yazeed's feedback).
+- Query: `GL Entry` where `project = PROJ-XXXX`, group by `account`
+- Expense accounts start with `5` (5xxx)
+- Sum debit - credit per account for net amount
+- **Sheet 6 is READ-ONLY** — validation only, never UPDATE the GL
+- Previous approach (PPI + source doctypes) was replaced
+
+## Partner / Engagement Manager Fields
+- **Partner**: `project_lead` (Employee ID) / `project_lead_name` (name) — NOT `custom_partner_name_value`
+- **Engagement Manager**: `project_manager` (Employee ID) / `project_manager_name` (name) — NOT `custom_engagement_manager`
+- When updating, should look up Employee by name and set the Employee ID link field
+
+## Customer Name Validation
+- Use Project's existing `customer` field (CRM-CUS-*) — NOT fuzzy name search
+- If Project already has a customer linked, compare `customer_name` against sheet value
+- If no customer linked, do a lookup — but the Project's own link is the source of truth
+
+## Sheet 3 Rate = Quotation Discount
+- Sheet "Rate" column contains the **discount percentage** as decimal (e.g., 0.36 = 36%)
+- ERP stores as percentage in `custom_discount_` (e.g., 36.0)
+- Validator converts ERP to decimal before comparing
+- This is a **Quotation-level field**, not per-resource
+
+## Tax Handling (Sheet 5)
+- For `Sales Tax & Charges` rows: only update qty=1 in the tax child row
+- The Quotation module auto-calculates the tax total from the quotation price
+- Do NOT push tax totals directly
+
+## Read-Only Modules (never UPDATE)
+- **GL Entry** (Sheet 6) — source of truth, read-only
+- **Sales Invoice items** (Sheet 7) — informational comparison only
+- **Payment Entry** (Sheet 7) — informational
+
+## Missing/Deleted Rows
+- **PED rows in ERP but not in sheet** → assumed correct (SKIP)
+- **3P Planned rows in ERP but not in sheet** → marked TO_DELETE (not actually deleted)
+- **Egypt employees** identified by `SG-E-*` prefix — different cost logic (invoices for past, rate card for future)
 
 ## Invoice Format Cross-Matching
 Sheet uses short format: `00331-2025` (sequence-year)
@@ -158,10 +195,32 @@ Valid states: Need Assigned Resources, Resources Assigned need approval, In Prog
 - "Signed" is NOT valid — flagged as BLOCKED
 - Transitions are constrained (e.g., Awarded → Need Assigned Resources → Running)
 
+## ERP Environments
+- **Production**: `https://engine.strategicgears.com`
+- **UAT**: `https://strategicgears-uat.frappe.cloud` (current target in config.py)
+- Same API token works for both
+- Switch by changing `ERP_BASE` in `config.py`
+
 ## Slack Coordination
-- Channel: `C09QNU090NS`
-- Thread: `1773689016.118239`
+- Migration channel: `C09D0202CNP`, Thread: `1776150865.623519`
+- Original channel: `C09QNU090NS`, Thread: `1773689016.118239`
 - Stakeholders: Hashim (`U08GPAMV93Q`), Yazeed (`U08T55Y9SS2`), Abduljalil (`U067U3SR9RP`)
+
+## Yazeed Feedback History
+- **v1**: 15 comments — GL source, Task CREATE bug, customer lookup, Egypt resources, partner/EM fields
+- **v2**: 16 comments — wrong customer match, partner=project_lead_name, GL/SI read-only, tax qty=1, TO_DELETE order
+- **v3/v4**: Approved. One sheet error (PROJ-1313 tax) fixed by Yazeed.
+
+## Apply Implementation Status
+| Module | UPDATE | CREATE | Status |
+|---|---|---|---|
+| Project (Sheet 1) | Fields, dates, billability | — | Working |
+| PED (Sheet 4) | to_date, ratio_ | New rows | Working |
+| Quotation (Sheet 3) | custom_discount_, resources | New resource rows | **Not implemented** |
+| Quotation (Sheet 5) | 3P costs, tax qty=1 | New 3P rows | **Not implemented** |
+| Task (Sheet 7) | — | Full Task creation | **Not implemented** |
+| GL Entry (Sheet 6) | — | — | Read-only (no apply) |
+| Sales Invoice (Sheet 7) | — | — | Read-only (no apply) |
 
 ## Dependencies
 - `openpyxl` — Excel parsing
